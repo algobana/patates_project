@@ -1,0 +1,9 @@
+tensorflow
+opencv-python
+numpy
+pillow
+matplotlib
+scikit-learn
+flask
+requests
+pygame
