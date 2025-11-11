@@ -1,5 +1,19 @@
+# Python cache
 *.pyc
 __pycache__/
 .venv/
+
+# Model files
 models/*.h5
+models/*.keras
 models/*.tflite
+
+# Data folders (large or local-only)
+data/raw/
+data/dataset/
+data/*.zip
+
+# System / IDE stuff
+.DS_Store
+Thumbs.db
+.vscode/
