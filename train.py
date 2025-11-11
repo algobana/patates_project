@@ -10,8 +10,8 @@ import numpy as np
 # --------------------
 # Parametreler
 # --------------------
-IMG_SIZE = (128, 128)
-BATCH_SIZE = 32
+IMG_SIZE = (160, 160)   # küçük yeşil lekeler için 160 daha iyi
+BATCH_SIZE = 24         # 160 çözünürlükte VRAM için 24 güvenli
 DATA_DIR = "data/dataset"
 CLASSES = ["healthy","green","rotten"]
 EPOCHS = 15
@@ -20,6 +20,21 @@ MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 BEST_MODEL_PATH = str(MODEL_DIR / "potato_model.keras")
 BEST_MODEL_H5   = str(MODEL_DIR / "potato_model.h5")  # opsiyonel
+
+# --------------------
+# Class Weights (dengesizliği telafi)
+# --------------------
+def compute_class_weights(train_dir=os.path.join(DATA_DIR,"train"), classes=CLASSES):
+    counts = {}
+    for c in classes:
+        p = os.path.join(train_dir, c)
+        n = len([f for f in os.listdir(p) if f.lower().endswith((".jpg",".jpeg",".png",".bmp",".webp"))])
+        counts[c] = max(1, n)
+    total = sum(counts.values())
+    weights = {i: total/(len(classes)*counts[cls]) for i, cls in enumerate(classes)}
+    print("[class_counts]", counts)
+    print("[class_weights]", weights)
+    return weights
 
 # --------------------
 # Dataset
@@ -37,12 +52,15 @@ def build_datasets():
     )
     AUTOTUNE = tf.data.AUTOTUNE
 
-    # Augmentation sadece train'de
+    # Daha güçlü renk augmentasyonu (brightness/saturation/hue)
     aug = tf.keras.Sequential([
         layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.1),
-        layers.RandomZoom(0.1),
-        layers.RandomContrast(0.1),
+        layers.RandomRotation(0.12),
+        layers.RandomZoom(0.12),
+        layers.RandomContrast(0.15),
+        layers.Lambda(lambda x: tf.image.random_brightness(x, max_delta=0.15)),
+        layers.Lambda(lambda x: tf.image.random_saturation(x, lower=0.85, upper=1.15)),
+        layers.Lambda(lambda x: tf.image.random_hue(x, max_delta=0.03)),
     ], name="augmentation")
 
     def preprocess(x, y):
@@ -62,12 +80,10 @@ def build_model(num_classes=3, img_size=IMG_SIZE):
     base.trainable = False  # frozen base
 
     inputs = layers.Input(shape=img_size + (3,))
-    x = inputs
-    # (preprocess zaten dataset'te uygulandı; burada tekrar etmiyoruz)
-    x = base(x, training=False)
+    x = base(inputs, training=False)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.35)(x)
+    x = layers.Dense(160, activation="relu")(x)
     x = layers.BatchNormalization()(x)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
 
@@ -93,12 +109,15 @@ def main():
         ModelCheckpoint(BEST_MODEL_PATH, monitor="val_accuracy", save_best_only=True, mode="max", verbose=1),
     ]
 
+    class_weights = compute_class_weights()
+
     print("Eğitim başlıyor…")
     history = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
-        callbacks=callbacks
+        callbacks=callbacks,
+        class_weight=class_weights
     )
 
     # En iyi modeli yükle (ModelCheckpoint sayesinde BEST_MODEL_PATH yazıldı)
@@ -107,7 +126,7 @@ def main():
     val_loss, val_acc = best.evaluate(val_ds, verbose=0)
     print(f"val_loss={val_loss:.4f}  val_accuracy={val_acc:.4f}")
 
-    # Opsiyonel: .h5 olarak da kaydet (h5py yüklü)
+    # Opsiyonel: .h5 olarak da kaydet
     best.save(BEST_MODEL_H5)
 
     # Örnek: birkaç batch'ten toplu tahmin (hızlı bakış)
@@ -125,4 +144,6 @@ def main():
     print(" -", BEST_MODEL_H5)
 
 if __name__ == "__main__":
+    # İstersen XLA/JIT kapat: uyarıları azaltır
+    # tf.config.optimizer.set_jit(False)
     main()

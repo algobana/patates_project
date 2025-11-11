@@ -1,172 +1,234 @@
-import os, time, threading, queue, random
-import pygame
-import requests
-from pathlib import Path
+# simulation/line_sim.py  (fotoğraflı + çerçeve renkli)
+import os, random, time
+import pygame, requests
+from PIL import Image
+import io
 
-# ---------------- Config ----------------
-API_URL = "http://127.0.0.1:5000/analyze"  # Flask URL
-IMG_DIRS = [
-    "data/dataset/val/healthy",
-    "data/dataset/val/green",
-    "data/dataset/val/rotten",
-]
-CLASSES = ["healthy","green","rotten"]
-CONF_THRESHOLD = 0.60  # altı 'LOW' diye işaretle
+API_URL = "http://127.0.0.1:5000/analyze"
+DATA_VAL = "data/dataset/val"
+
+WIDTH, HEIGHT = 1000, 560
 FPS = 60
-SPEED = 2   # konveyör hızı (px/frame)
 
-# --------------- Helpers ----------------
-def load_images():
-    imgs = []
-    for d in IMG_DIRS:
-        p = Path(d)
-        if not p.exists(): 
-            continue
-        for f in sorted(p.iterdir()):
-            if f.suffix.lower() in [".jpg",".jpeg",".png",".bmp",".webp"]:
-                imgs.append(str(f))
-    random.shuffle(imgs)
-    return imgs
+BELT_Y = 300
+BELT_SPEED = 0.9
+SPAWN_MS = 2800
+SCAN_X = 380
+GATE_RED_X = 620
+GATE_GREEN_X = 820
+GATE_OPEN_MS = 900
 
-def analyze_file(path):
+POTATO_W, POTATO_H = 96, 96   # daha büyük ve net
+DROP_ACCEL = 0.25
+
+BG = (17,18,22)
+BELT_DARK = (28,30,35)
+BELT_LIGHT = (40,42,48)
+WHITE = (235,235,240)
+SILVER = (200,200,200)
+GREEN = (40,200,90)
+RED   = (220,60,60)
+YELLOW= (255,225,80)
+ORANGE= (255,170,60)
+CYAN  = (80,200,220)
+MUTED = (140,145,150)
+
+def load_val_paths():
+    cls_dirs = []
+    for cls in ("healthy", "green", "rotten"):
+        p = os.path.join(DATA_VAL, cls)
+        if os.path.isdir(p):
+            files = [os.path.join(p, f) for f in os.listdir(p)
+                     if f.lower().endswith((".jpg",".jpeg",".png",".bmp",".webp"))]
+            if files:
+                cls_dirs.append((cls, files))
+    return cls_dirs
+
+VAL_POOL = load_val_paths()
+if not VAL_POOL:
+    raise SystemExit("Val klasöründe görüntü yok.")
+
+def _load_surface(path, size):
+    """
+    Görseli Pygame'e Surface olarak yükle. WEBP gibi formatlarda
+    pygame takılırsa PIL ile dönüştürüp geçeriz.
+    """
     try:
-        with open(path, "rb") as f:
-            r = requests.post(API_URL, files={"file": f}, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+        img = pygame.image.load(path).convert_alpha()
+        img = pygame.transform.smoothscale(img, size)
+        return img
+    except Exception:
+        with Image.open(path).convert("RGBA") as im:
+            im = im.resize(size, Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            buf.seek(0)
+            img = pygame.image.load(buf, "dummy.png").convert_alpha()
+            return img
 
-# Arka planda inference kuyruğu (UI donmasın)
-class Analyzer(threading.Thread):
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.q_in  = queue.Queue()
-        self.q_out = queue.Queue()
-    def run(self):
-        while True:
-            item_id, path = self.q_in.get()
-            res = analyze_file(path)
-            self.q_out.put((item_id, res))
+def pick_random_val_file():
+    _, files = random.choice(VAL_POOL)
+    return random.choice(files)
 
-# --------------- Pygame -----------------
-W, H = 1000, 420
-CAM_X = 480    # “kamera çizgisi”
+def call_api_with_file(path):
+    with open(path, "rb") as f:
+        r = requests.post(API_URL, files={"file": f}, timeout=6)
+    r.raise_for_status()
+    return r.json()
 
 class Potato:
-    def __init__(self, path, x, y):
-        self.path = path
-        self.img  = pygame.image.load(path).convert()
-        self.img  = pygame.transform.smoothscale(self.img, (120, 120))
-        self.rect = self.img.get_rect()
-        self.rect.topleft = (x, y)
-        self.id   = id(self)
-        self.sent = False
-        self.label = "..."
-        self.conf  = 0.0
-        self.low_conf = False
-        self.error = None
+    def __init__(self, x, y, file_path):
+        self.x, self.y = x, y
+        self.w, self.h = POTATO_W, POTATO_H
+        self.vy = 0.0
+        self.file_path = file_path
+        self.img = _load_surface(file_path, (self.w, self.h))
+        self.scanned = False
+        self.decided = False
+        self.route = "MAIN"
+        self.label = "PENDING"
+        self.conf = 0.0
+        self.low = False
+        self.tie = False
+        self.frame_color = MUTED
+        self.tag = "PENDING"
 
-    def update(self):
-        self.rect.x += SPEED
+    def decide_from_result(self, res: dict):
+        self.label = res.get("label", "healthy")
+        self.conf  = float(res.get("confidence", 0.0))
+        self.low   = bool(res.get("low_confidence", False))
+        self.tie   = bool(res.get("tie_green_healthy", False))
 
-    def draw(self, screen, font):
-        screen.blit(self.img, self.rect)
-        # kutu ve metin
-        text = f"{self.label} ({self.conf:.2f})" if self.error is None else f"ERR"
-        color = (0,200,0) if self.label=="healthy" else (200,200,0) if self.label=="green" else (200,0,0)
-        if self.low_conf: color = (255,140,0)
-        pygame.draw.rect(screen, color, self.rect, 2)
-        label_surf = font.render(text, True, color)
-        screen.blit(label_surf, (self.rect.x, self.rect.y - 20))
+        if self.low or self.tie:
+            self.route = "HOLD"
+            self.frame_color = ORANGE if self.low else YELLOW
+            self.tag   = "LOW" if self.low else "TIE"
+        elif self.label == "rotten":
+            self.route = "REJECT_RED"
+            self.frame_color = RED
+            self.tag = "ROTTEN"
+        elif self.label == "green":
+            self.route = "REJECT_GREEN"
+            self.frame_color = GREEN
+            self.tag = "GREEN"
+        else:
+            self.route = "MAIN"
+            self.frame_color = SILVER
+            self.tag = "HEALTHY"
+
+        self.decided = True
+
+def draw_belt(surface, t):
+    surface.fill(BG)
+    pygame.draw.rect(surface, BELT_DARK, (0, BELT_Y-16, WIDTH, 64))
+    offset = int((t*BELT_SPEED*2) % 50)
+    for x in range(-offset, WIDTH, 50):
+        pygame.draw.rect(surface, BELT_LIGHT, (x, BELT_Y-14, 30, 60), border_radius=8)
+    pygame.draw.line(surface, CYAN, (SCAN_X, BELT_Y-28), (SCAN_X, BELT_Y+52), 2)
+
+def draw_gate(surface, x, open_until_ms, now_ms, color):
+    pygame.draw.rect(surface, (60, 60, 65), (x-4, BELT_Y-40, 8, 80), border_radius=2)
+    led_on = now_ms < open_until_ms
+    pygame.draw.circle(surface, color if led_on else (100,100,105),
+                       (x, BELT_Y+48), 9 if led_on else 7)
+
+def draw_potato(surface, p: Potato, font):
+    # Fotoğrafı çiz
+    surface.blit(p.img, (p.x, p.y))
+    # Çerçeve (sonuca göre renk)
+    border_rect = pygame.Rect(p.x-4, p.y-4, p.w+8, p.h+8)
+    pygame.draw.rect(surface, p.frame_color, border_rect, width=4, border_radius=10)
+    # Etiket
+    caption = f"{p.tag} {p.conf:.2f}" if p.decided else "PENDING"
+    txt = font.render(caption, True, WHITE)
+    surface.blit(txt, (p.x - 4, p.y + p.h + 6))
 
 def main():
     pygame.init()
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Potato Conveyor — Pygame + Flask")
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("ZEHİRLİ PATATES | Fotoğraflı + Çerçeveli Simülasyon")
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("Arial", 18)
+    font = pygame.font.SysFont("consolas", 18)
 
-    # Arka plan / bant
-    bg = pygame.Surface((W, H))
-    bg.fill((30, 30, 30))
-    belt = pygame.Rect(0, H//2 - 60, W, 120)
+    potatoes = []
+    last_spawn = pygame.time.get_ticks()
+    gate_red_open_til = 0
+    gate_green_open_til = 0
 
-    # Kamera çizgisi
-    cam_line = pygame.Rect(CAM_X, 0, 3, H)
-
-    # Görselleri yükle
-    files = load_images()
-    if not files:
-        print("Uyarı: Görsel bulunamadı. IMG_DIRS dizinlerini kontrol et.")
-    # İlk nesneleri biraz geriden başlat
-    items = []
-    x = -200
-    lanes = [belt.top + 5, belt.top + 55]  # iki hat
-    for i, f in enumerate(files[:15]):  # fazla kalabalık olmasın
-        items.append(Potato(f, x, random.choice(lanes)))
-        x -= random.randint(160, 260)
-
-    # Analyzer thread
-    analyzer = Analyzer()
-    analyzer.start()
+    # İlk patates
+    potatoes.append(Potato(40, BELT_Y- (POTATO_H//2), pick_random_val_file()))
 
     running = True
-    t0 = time.time()
-
+    last_info = "Ready."
     while running:
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
+        dt = clock.tick(FPS)
+        now = pygame.time.get_ticks()
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
                 running = False
-            elif ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    running = False
-                elif ev.key == pygame.K_SPACE:
-                    # yeni bir batch ekle
-                    for f in random.sample(files, min(5, len(files))):
-                        items.append(Potato(f, -200, random.choice(lanes)))
 
-        # Update
-        for it in items:
-            it.update()
-            # Kamera çizgisine ilk kez geçtiğinde kuyruğa at
-            if not it.sent and it.rect.centerx >= CAM_X:
-                analyzer.q_in.put((it.id, it.path))
-                it.sent = True
+        # Yavaş spawn
+        if now - last_spawn >= SPAWN_MS:
+            potatoes.append(Potato(40, BELT_Y - (POTATO_H // 2), pick_random_val_file()))
+            last_spawn = now
 
-        # Cevapları topla
-        while not analyzer.q_out.empty():
-            item_id, res = analyzer.q_out.get()
-            for it in items:
-                if it.id == item_id:
-                    if "error" in res:
-                        it.error = res["error"]
-                        it.label = "error"
-                        it.conf = 0.0
-                        it.low_conf = True
-                    else:
-                        it.label = res.get("label","?")
-                        it.conf  = float(res.get("confidence",0.0))
-                        it.low_conf = (it.conf < CONF_THRESHOLD)
-                    break
 
-        # Çiz
-        screen.blit(bg, (0,0))
-        pygame.draw.rect(screen, (50, 50, 50), belt)           # konveyör
-        pygame.draw.rect(screen, (120, 120, 255), cam_line)    # kamera çizgisi
-        # bilgi paneli
-        msg = f"Items: {len(items)}   API: {API_URL}   FPS: {int(clock.get_fps())}"
-        screen.blit(font.render(msg, True, (200,200,200)), (10, 10))
-        screen.blit(font.render("Space: yeni batch, Esc: çıkış", True, (160,160,160)), (10, 34))
+        # Hareket/karar
+        for p in potatoes:
+            p.x += BELT_SPEED
 
-        for it in items:
-            it.draw(screen, font)
+            # SCAN çizgisi → API çağrısı
+            if (not p.scanned) and (p.x + p.w//2 >= SCAN_X):
+                t0 = time.perf_counter()
+                try:
+                    res = call_api_with_file(p.file_path)
+                    p.decide_from_result(res)
+                    latency = (time.perf_counter() - t0)*1000
+                    last_info = f"{os.path.basename(p.file_path)} -> {p.label} ({p.conf:.2f}) [{int(latency)} ms]"
+                except Exception as ex:
+                    p.decide_from_result({"label":"healthy","confidence":0.0,
+                                          "low_confidence":True,"tie_green_healthy":False})
+                    last_info = f"API error -> HOLD: {ex}"
+                p.scanned = True
 
-        # Ekranın dışına çıkanları at
-        items = [it for it in items if it.rect.left <= W + 40]
+            # Kapak/düşüş
+            if p.decided:
+                if p.route == "REJECT_RED" and p.x + p.w//2 >= GATE_RED_X:
+                    gate_red_open_til = now + GATE_OPEN_MS
+                    p.vy += DROP_ACCEL
+                    p.y += p.vy
+                elif p.route == "REJECT_GREEN" and p.x + p.w//2 >= GATE_GREEN_X:
+                    gate_green_open_til = now + GATE_OPEN_MS
+                    p.vy += DROP_ACCEL
+                    p.y += p.vy
+                # HOLD/MAIN → düşüş yok
+
+        # Çizimler
+        t = pygame.time.get_ticks()/1000.0
+        draw_belt(screen, t)
+        draw_gate(screen, GATE_RED_X, gate_red_open_til, now, RED)
+        draw_gate(screen, GATE_GREEN_X, gate_green_open_til, now, GREEN)
+
+        removed = []
+        for p in potatoes:
+            draw_potato(screen, p, font)
+            if p.x > WIDTH + 120 or p.y > HEIGHT + 120:
+                removed.append(p)
+        for p in removed:
+            try: potatoes.remove(p)
+            except: pass
+
+        # HUD
+        hud = [
+            f"FPS: {clock.get_fps():.0f}",
+            f"Info: {last_info}",
+            "Renkli çerçeve: LOW→Turuncu | TIE→Sarı | rotten→Kırmızı | green→Yeşil | healthy→Gri",
+            "Hız/Akış: BELT_SPEED, SPAWN_MS; Kapak süresi: GATE_OPEN_MS"
+        ]
+        for i, s in enumerate(hud):
+            screen.blit(font.render(s, True, WHITE if i < 3 else (180,180,185)), (12, 14 + i*22))
 
         pygame.display.flip()
-        clock.tick(FPS)
 
     pygame.quit()
 
