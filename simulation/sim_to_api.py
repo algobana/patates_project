@@ -51,7 +51,7 @@ if not VAL_POOL:
 def _load_surface(path, size):
     """
     Görseli Pygame'e Surface olarak yükle. WEBP gibi formatlarda
-    pygame takılırsa PIL ile dönüştürüp geçeriz.
+    pygame takılırsa PIL ile dönüştürüp geçelim.
     """
     try:
         img = pygame.image.load(path).convert_alpha()
@@ -146,7 +146,7 @@ def draw_potato(surface, p: Potato, font):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("ZEHİRLİ PATATES | Fotoğraflı + Çerçeveli Simülasyon")
+    pygame.display.set_caption("PATATO BELT")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas", 18)
 
@@ -222,8 +222,8 @@ def main():
         hud = [
             f"FPS: {clock.get_fps():.0f}",
             f"Info: {last_info}",
-            "Renkli çerçeve: LOW→Turuncu | TIE→Sarı | rotten→Kırmızı | green→Yeşil | healthy→Gri",
-            "Hız/Akış: BELT_SPEED, SPAWN_MS; Kapak süresi: GATE_OPEN_MS"
+            "Frame Colors: low→ORANGE | tie→YELLOW | rotten→RED | green→GREEN | healthy→GRAY",
+            "Speed/Flow: BELT_SPEED, SPAWN_MS; Cover time: GATE_OPEN_MS"
         ]
         for i, s in enumerate(hud):
             screen.blit(font.render(s, True, WHITE if i < 3 else (180,180,185)), (12, 14 + i*22))
