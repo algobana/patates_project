@@ -109,10 +109,10 @@ The model shows near-perfect classification with negligible error.
 
 ## 👨‍💻 Author
 **Berk AŞCI**
-* **Project:** Data Mining Term Project
 * **Date:** December 2025
 
 ---
 
 ## 📜 License
+
 This project is open-source and available under the [MIT License](LICENSE).
