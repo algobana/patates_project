@@ -92,11 +92,10 @@ Three algorithms were benchmarked. The CNN model (MobileNetV2) demonstrated supe
 The model shows near-perfect classification with negligible error.
 
 ![Confusion Matrix](research/images/confusion_matrix.png)
-*(Please upload your confusion matrix image to the repo and link it here)*
 
 ---
 
-## 📷 Screenshots
+## 📷 Screenshot
 
 ### Simulation Interface
 ![Simulation](research/images/potato_belt.gif)
@@ -116,3 +115,4 @@ The model shows near-perfect classification with negligible error.
 ## 📜 License
 
 This project is open-source and available under the [MIT License](LICENSE).
+
