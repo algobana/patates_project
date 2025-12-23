@@ -6,7 +6,7 @@
 ![Status](https://img.shields.io/badge/Status-Completed-brightgreen)
 
 ## 📖 Overview
-**Potato Belt** is an end-to-end Computer Vision project designed to automate the sorting process of potatoes in industrial settings. Using Deep Learning (**MobileNetV2**), the system classifies potatoes into three categories with **99.29% accuracy**:
+**Potato Belt** is an end-to-end Computer Vision project designed to automate the sorting process of potatoes in industrial settings. Using Deep Learning (**MobileNetV2**), the system classifies potatoes into three categories with up to **99.29% test accuracy**:
 
 1.  **Healthy:** Fit for consumption.
 2.  **Rotten:** Fungal defect, must be discarded.
@@ -48,7 +48,10 @@ cd patates_project
 pip install -r requirements.txt
 ```
 
+
 ## 3. Run the Backend (API)
+Note: A trained model file must be provided before running the backend service.
+
 The Flask server loads the trained model and listens for image requests.
 ```bash
 cd backend
@@ -69,12 +72,16 @@ python sim_to_api.py
 ## 📊 Dataset & Preprocessing
 The dataset was aggregated from **Roboflow Universe** and custom-collected samples.
 
+Data augmentation was applied only on the training set to prevent data leakage.
+
 * **Total Images:** ~3,800 (Balanced via augmentation).
 * **Classes:** Green (~1,600), Healthy (~1,000), Rotten (~1,200).
 * **Preprocessing:**
     * Resized to **160x160** pixels.
     * Normalized pixel intensities to **[-1, 1]** (MobileNetV2 standard).
     * **One-Hot Encoding** for target labels.
+
+The dataset includes open-source samples from Roboflow Universe and custom-collected images, used in compliance with their respective licenses.
 
 ---
 
@@ -115,4 +122,5 @@ The model shows near-perfect classification with negligible error.
 ## 📜 License
 
 This project is open-source and available under the [MIT License](LICENSE).
+
 
