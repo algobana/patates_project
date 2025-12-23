@@ -8,7 +8,7 @@ from keras.applications.mobilenet_v2 import preprocess_input
 #  Ayarlar
 # ================================
 CLASSES = ["healthy", "green", "rotten"]
-IMG_SIZE = (128, 128)
+IMG_SIZE = (160, 160)
 
 def pick_model_path():
     ft = Path("models/potato_model_ft.keras")
