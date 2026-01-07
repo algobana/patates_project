@@ -1,161 +1,108 @@
-import io, os, random
+# backend/app.py
+import io, os
 from pathlib import Path
 from flask import Flask, request, jsonify
-from PIL import Image, ImageOps, ImageEnhance, ImageStat
+from PIL import Image
 import numpy as np
 import tensorflow as tf
 from keras.applications.mobilenet_v2 import preprocess_input
 
-# ================================
-#  1. AYARLAR
-# ================================
+# ------------ Config ------------
 CLASSES = ["green", "healthy", "rotten"]
-
 MODEL_FT = Path("models/potato_model_ft.keras")
 MODEL_BASE = Path("models/potato_model.keras")
 
-# --- AGRESİF ANOMALİ AYARLARI ---
-UNCERTAINTY_THRESHOLD = 0.09  
-CONF_THRESHOLD = 0.85
-IMG_SIZE = (160, 160)
+# Eşikler
+CONF_THRESHOLD = 0.45      # low_confidence için alt sınır
+TIE_DELTA = 0.06           # healthy vs green yakınlığı için eşik
+USE_TTA = True             # test-time augmentation (horizontal flip)
 
-# ================================
-#  2. MODEL YÜKLEME
-# ================================
-def pick_model_path():
-    selected = MODEL_FT if MODEL_FT.exists() else MODEL_BASE
-    print(f"[Backend] Yüklenen Model: {selected}")
-    return str(selected)
+# ------------ Model ------------
+MODEL_PATH = str(MODEL_FT if MODEL_FT.exists() else MODEL_BASE)
+model = tf.keras.models.load_model(MODEL_PATH)
 
-MODEL_PATH = pick_model_path()
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print("✅ Model Hazır (Agresif TTA + Taş Dedektörü v4).")
-except Exception as e:
-    print(f"❌ HATA: {e}")
-    model = None
+# Model giriş boyutunu otomatik al (mismatch olmaz)
+H, W = model.input_shape[1], model.input_shape[2]
+IMG_SIZE = (W, H)
 
 app = Flask(__name__)
 
-# ================================
-#  3. YARDIMCI FONKSİYONLAR
-# ================================
-def prepare_image(pil_img):
-    img = pil_img.resize(IMG_SIZE)
-    arr = np.array(img, dtype=np.float32)
+# ------------ Helpers ------------
+def to_batch(pil_img, img_size=IMG_SIZE):
+    """PIL -> model girişi (1, H, W, 3), preprocess_input ile [-1,1]."""
+    arr = np.array(pil_img.convert("RGB").resize(img_size), dtype=np.float32)
     arr = preprocess_input(arr)
     return np.expand_dims(arr, 0)
 
-def predict_with_aggressive_tta(pil_img):
-    """
-    🔥 AGRESİF TTA v4 (Düzeltilmiş Taş Dedektörü)
-    Eşik değeri 20'ye çekildi. Artık tozlu patatesleri taş sanmayacak.
-    Sadece gerçekten gri olan taşları yakalayacak.
-    """
-    
-    # --- 1. ADIM: TAŞ KONTROLÜ (SATURATION CHECK) 🪨 ---
-    hsv_img = pil_img.convert("HSV")
-    saturation_channel = hsv_img.split()[1]
-    # Ortalamasını hesapla (0 = Tam Gri, 255 = Çok Canlı Renk)
-    avg_sat = ImageStat.Stat(saturation_channel).mean[0]
-    
-    # DÜZELTME: Eşik 45'ten 20'ye indirildi.
-    # Patatesler (tozlu olsa bile) genelde 25-30 üstüdür. Taşlar 10-15 civarıdır.
-    is_stone_suspect = avg_sat < 20 
+def predict_with_flags(pil_img):
+    """Tek görsel için tahmin + low_confidence + tie_green_healthy bayrakları."""
+    p0 = model.predict(to_batch(pil_img), verbose=0)[0]
+    if USE_TTA:
+        p1 = model.predict(to_batch(pil_img.transpose(Image.FLIP_LEFT_RIGHT)), verbose=0)[0]
+        p = (p0 + p1) / 2.0
+    else:
+        p = p0
 
-    # Konsola bilgi ver (Debug için)
-    print(f"   [🔍 ANALİZ] Renk Doygunluğu (Sat): {avg_sat:.1f} | Taş Şüphesi: {is_stone_suspect}")
+    idx = int(np.argmax(p))
+    conf = float(np.max(p))
+    probs = {
+        "healthy": float(p[0]),
+        "green":   float(p[1]),
+        "rotten":  float(p[2]),
+    }
 
-    # --- 2. ADIM: TTA (AUGMENTATION) ---
-    img_orig = ImageOps.exif_transpose(pil_img).convert("RGB")
-    
-    img_flip = img_orig.transpose(Image.FLIP_LEFT_RIGHT)
-    img_rot = img_orig.rotate(90)
-    
-    enhancer_col = ImageEnhance.Color(img_orig)
-    img_sat = enhancer_col.enhance(1.2) 
+    return {
+        "label": CLASSES[idx],
+        "confidence": float(conf),
+        "probs": probs,
+        "low_confidence": bool(conf < CONF_THRESHOLD),
+        # Tie sadece green-healthy arasında geçerli, rotten hariç
+        "tie_green_healthy": bool(
+            (max(p[0], p[1]) > p[2]) and abs(float(p[0]) - float(p[1])) < TIE_DELTA
+        ),
+    }
 
-    enhancer_con = ImageEnhance.Contrast(img_orig)
-    img_con = enhancer_con.enhance(1.2)
 
-    batch = np.vstack([
-        prepare_image(img_orig),
-        prepare_image(img_flip),
-        prepare_image(img_rot),
-        prepare_image(img_sat),
-        prepare_image(img_con)
-    ])
-    
-    preds = model.predict(batch, verbose=0)
-    
-    # --- 3. ADIM: SONUÇLARI HARMANLA ---
-    orig_pred = preds[0]
-    idx = np.argmax(orig_pred)
-    label = CLASSES[idx]
-    confidence = float(orig_pred[idx])
-
-    std_preds = np.std(preds, axis=0)
-    uncertainty = float(np.mean(std_preds))
-
-    # 🔥 MÜDAHALE: Eğer taş şüphesi varsa belirsizliği tavan yaptır!
-    if is_stone_suspect:
-        # Rastgelelik (0.45 - 0.65 arası) -> Ekranda sayı değişsin diye
-        penalty = random.uniform(0.45, 0.65)
-        print(f"   🪨 TAŞ TESPİT EDİLDİ! (Sat: {avg_sat:.1f}) -> Uncertainty +{penalty:.2f} eklendi.")
-        uncertainty += penalty
-        confidence = 0.3    # Güveni düşür
-    
-    probs = {CLASSES[i]: float(orig_pred[i]) for i in range(len(CLASSES))}
-
-    return label, confidence, uncertainty, probs
-
-# ================================
-#  4. ROUTE
-# ================================
+# ------------ Routes ------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "mode": "Aggressive TTA + Stone Detector v4"})
+    return jsonify({
+        "status": "ok",
+        "model": MODEL_PATH,
+        "img_size": IMG_SIZE,
+        "classes": CLASSES,
+        "use_tta": USE_TTA,
+        "conf_threshold": CONF_THRESHOLD,
+        "tie_delta": TIE_DELTA,
+    })
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    if "file" not in request.files: return jsonify({"error": "No file"}), 400
-    
+    if "file" not in request.files:
+        return jsonify({"error": "no file"}), 400
     try:
-        f = request.files["file"]
-        pil = Image.open(io.BytesIO(f.read()))
-
-        # Tahmin Yap
-        label, conf, unc, probs = predict_with_aggressive_tta(pil)
-
-        is_risky = False
-        
-        # 1. Skor Düşükse
-        if conf < CONF_THRESHOLD:
-            is_risky = True
-            
-        # 2. Belirsizlik Yüksekse
-        print(f"[{label}] Conf: {conf:.2f} | Unc: {unc:.4f}") 
-        
-        if unc > UNCERTAINTY_THRESHOLD:
-            is_risky = True
-            print(f"   >>> ⚠️ RİSK LİMİTİ AŞILDI!")
-
-        # Tie Mantığı
-        p_green = probs.get("green", 0)
-        p_healthy = probs.get("healthy", 0)
-        tie = (label != "rotten") and (abs(p_green - p_healthy) < 0.06)
-
-        return jsonify({
-            "label": label,
-            "confidence": conf,
-            "uncertainty": unc,
-            "probs": probs,
-            "low_confidence": is_risky, 
-            "tie_green_healthy": tie
-        })
-
+        data = request.files["file"].read()
+        pil = Image.open(io.BytesIO(data))
+        out = predict_with_flags(pil)
+        return jsonify(out)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/analyze/batch", methods=["POST"])
+def analyze_batch():
+    if "files" not in request.files:
+        return jsonify({"error": "no files"}), 400
+    results = []
+    for f in request.files.getlist("files"):
+        try:
+            pil = Image.open(f.stream)
+            out = predict_with_flags(pil)
+            out["filename"] = getattr(f, "filename", "")
+            results.append(out)
+        except Exception as e:
+            results.append({"filename": getattr(f, "filename", ""), "error": str(e)})
+    return jsonify({"results": results})
+
 if __name__ == "__main__":
+    # Geliştirme sunucusu
     app.run(host="0.0.0.0", port=5000, debug=False)

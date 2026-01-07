@@ -1,110 +1,98 @@
+from pathlib import Path
+from PIL import Image, ImageOps
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageOps
-from pathlib import Path
 from keras.applications.mobilenet_v2 import preprocess_input
 
 # ================================
-#  AYARLAR
+#  Ayarlar
 # ================================
 CLASSES = ["healthy", "green", "rotten"]
-IMG_SIZE = (160, 160) 
-UNCERTAINTY_THRESHOLD = 0.15  # Belirsizlik eşiği (Hassasiyete göre oyna)
+IMG_SIZE = (160, 160)
 
 def pick_model_path():
-    """Önce fine-tune (ft) modelini, yoksa base modeli seçer."""
     ft = Path("models/potato_model_ft.keras")
     base = Path("models/potato_model.keras")
-    selected = ft if ft.exists() else base
-    print(f"[Sistem] Seçilen Model: {selected}")
-    return str(selected)
+    return str(ft if ft.exists() else base)
 
-# GPU Bellek Ayarı (Opsiyonel)
+# (Opsiyonel) GPU bellek büyütmesi: küçük scriptlerde VRAM'i komple kilitlemez
 try:
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
         for g in gpus:
             tf.config.experimental.set_memory_growth(g, True)
-except:
+except Exception:
     pass
 
-# Modeli global olarak yükleyelim (Sürekli diskten okumasın, hızlanır)
-MODEL_PATH = pick_model_path()
-try:
-    GLOBAL_MODEL = tf.keras.models.load_model(MODEL_PATH)
-except Exception as e:
-    print(f"❌ Model Yükleme Hatası: {e}")
-    GLOBAL_MODEL = None
+# ================================
+#  Görsel bütünlüğü kontrolü
+# ================================
+def quick_image_check(root="data/dataset/train", limit=5):
+    """
+    Dataset'te rastgele birkaç görseli açarak dosya bozulması olup olmadığını kontrol eder.
+    """
+    root = Path(root)
+    cnt = 0
+    for p in root.rglob("*.*"):
+        if p.suffix.lower() not in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            continue
+        try:
+            with Image.open(p) as im:
+                ImageOps.exif_transpose(im).convert("RGB")
+            cnt += 1
+            if cnt >= limit:
+                break
+        except Exception as e:
+            print(f"Bozuk dosya: {p} -> {e}")
+    print(f"Açılan örnek sayısı: {cnt}")
 
 # ================================
-#  YENİLİK: Monte Carlo Dropout 🧠
+#  Tek görsel tahmini
 # ================================
-def predict_with_uncertainty(model, img_array, n_iter=10):
+def predict_image(path, img_size=IMG_SIZE, topk=3, verbose=True):
     """
-    Modeli 'training=True' modunda N kere çalıştırır.
-    Dropout katmanları aktif olduğu için her seferinde farklı sonuç verir.
-    Bu sonuçların standart sapması (std) bize 'BELİRSİZLİĞİ' verir.
+    Tek bir görseli yükler, modeli çalıştırır ve tahmin döndürür.
+    Return: (pred_label, pred_conf, probs_dict)
     """
-    # (N, 160, 160, 3) boyutunda çoğalt
-    pixels_repeated = np.repeat(img_array, n_iter, axis=0)
-    
-    # training=True -> Dropout AKTİF (Bayesyen Yaklaşım)
-    preds = model(pixels_repeated, training=True) 
-    
-    # İstatistikleri hesapla
-    prediction_mean = np.mean(preds, axis=0)  # Ortalama tahmin
-    uncertainty = np.std(preds, axis=0)       # Standart sapma (Belirsizlik)
-    
-    # En yüksek sınıfa ait belirsizlik değeri
-    top_class_idx = np.argmax(prediction_mean)
-    confidence_score = prediction_mean[top_class_idx]
-    uncertainty_score = uncertainty[top_class_idx]
-    
-    return top_class_idx, confidence_score, uncertainty_score, prediction_mean
-
-# ================================
-#  Ana Tahmin Fonksiyonu
-# ================================
-def predict_image(path, verbose=True):
-    if GLOBAL_MODEL is None:
-        return "Error", 0.0, 0.0
+    model_path = pick_model_path()
+    try:
+        model = tf.keras.models.load_model(model_path)
+    except Exception as e:
+        raise RuntimeError(f"Model yüklenemedi: {model_path} -> {e}")
 
     p = Path(path)
     if not p.exists():
-        print(f"Resim bulunamadı: {path}")
-        return "Error", 0.0, 0.0
+        raise FileNotFoundError(f"Görsel bulunamadı: {path}")
 
-    # Resmi Hazırla
     try:
         with Image.open(p) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB").resize(IMG_SIZE)
-            img_array = np.array(im, dtype=np.float32)
-            img_array = preprocess_input(img_array) # -1, 1 normalizasyon
-            img_array = np.expand_dims(img_array, axis=0) # (1, 160, 160, 3)
+            im = ImageOps.exif_transpose(im).convert("RGB").resize(img_size)
     except Exception as e:
-        print(f"Resim işleme hatası: {e}")
-        return "Error", 0.0, 0.0
+        raise RuntimeError(f"Görsel açılamadı: {path} -> {e}")
 
-    # 🔥 YENİLİKÇİ TAHMİN (MC DROPOUT)
-    class_idx, conf, unc, all_probs = predict_with_uncertainty(GLOBAL_MODEL, img_array, n_iter=20)
-    
-    label = CLASSES[class_idx]
-    
-    # Karar Mekanizması: Eğer belirsizlik çok yüksekse 'UNCERTAIN' de.
-    final_decision = label
-    if unc > UNCERTAINTY_THRESHOLD:
-        final_decision = "UNCERTAIN"  # Yeni Sınıf!
-        if verbose: print(f"⚠️ DİKKAT: Model kararsız! (Belirsizlik: {unc:.4f})")
+    x = np.array(im, dtype=np.float32)
+    x = preprocess_input(x)
+    x = np.expand_dims(x, axis=0)
+
+    preds = model.predict(x, verbose=0)[0]
+    idx = int(np.argmax(preds))
+    conf = float(np.max(preds))
+    probs = {CLASSES[i]: float(preds[i]) for i in range(len(CLASSES))}
 
     if verbose:
-        print(f"📸 Görüntü: {p.name}")
-        print(f"🧠 Tahmin: {label} (Güven: {conf:.4f})")
-        print(f"📉 Belirsizlik (Varyans): {unc:.4f}")
-        print(f"📢 Nihai Karar: {final_decision}")
-        print("-" * 30)
+        print(f"Model: {model_path}")
+        print(f"Pred:  {CLASSES[idx]} (conf={conf:.2f})")
+        # Top-K
+        order = np.argsort(preds)[::-1][:topk]
+        for i in order:
+            print(f"  - {CLASSES[i]:7s}: {preds[i]:.3f}")
 
-    return final_decision, float(conf), float(unc)
+    return CLASSES[idx], conf, probs
 
+# ================================
+#  Manuel kullanım
+# ================================
 if __name__ == "__main__":
-    # Test et
-    predict_image("data/dataset/val/rotten/rot1.jpg") # Yolunu kendine göre ayarla
+    # quick_image_check()
+    # predict_image('data/dataset/val/green/example.jpg')
+    pass
